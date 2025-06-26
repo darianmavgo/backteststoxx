@@ -1,11 +1,17 @@
 -- Enable foreign key constraints and WAL mode
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA temp_store = MEMORY;
+PRAGMA cache_size = -2000;
 
-BEGIN TRANSACTION;
+-- Start fresh
+DROP TABLE IF EXISTS temp_prices;
+
+BEGIN IMMEDIATE TRANSACTION;
 
 -- Create a temporary table to store extracted prices
-CREATE TEMP TABLE IF NOT EXISTS temp_prices AS
+CREATE TEMP TABLE temp_prices AS
 WITH valid_emails AS (
     -- Get emails with sufficient plain_text content and valid tickers
     SELECT 
@@ -37,160 +43,111 @@ number_positions AS (
         buy_pos,
         stop_pos,
         target_pos,
-        -- Extract text segments after keywords
-        SUBSTR(email_text, buy_pos, 50) as buy_segment,
-        SUBSTR(email_text, stop_pos, 50) as stop_segment,
-        SUBSTR(email_text, target_pos, 50) as target_segment,
-        -- Find positions of price indicators and words
-        INSTR(SUBSTR(email_text, buy_pos, 50), '$') as buy_dollar_pos,
-        INSTR(SUBSTR(email_text, buy_pos, 50), '@') as buy_at_pos,
-        INSTR(SUBSTR(email_text, buy_pos, 50), 'UNDER') as buy_under_pos,
-        INSTR(SUBSTR(email_text, buy_pos, 50), 'AT') as buy_at_word_pos,
-        INSTR(SUBSTR(email_text, stop_pos, 50), '$') as stop_dollar_pos,
-        INSTR(SUBSTR(email_text, stop_pos, 50), '@') as stop_at_pos,
-        INSTR(SUBSTR(email_text, stop_pos, 50), 'AT') as stop_at_word_pos,
-        INSTR(SUBSTR(email_text, target_pos, 50), '$') as target_dollar_pos,
-        INSTR(SUBSTR(email_text, target_pos, 50), '@') as target_at_pos,
-        INSTR(SUBSTR(email_text, target_pos, 50), 'AT') as target_at_word_pos
+        -- Extract text segments after keywords (larger context)
+        SUBSTR(email_text, buy_pos, 100) as buy_segment,
+        SUBSTR(email_text, stop_pos, 100) as stop_segment,
+        SUBSTR(email_text, target_pos, 100) as target_segment
     FROM price_positions
 ),
 extracted_numbers AS (
     SELECT 
         email_id,
         ticker,
-        -- Extract numbers after price indicators
+        -- Extract first number after BUY
         CAST(
             TRIM(
-                SUBSTR(
-                    buy_segment,
-                    CASE 
-                        WHEN buy_dollar_pos > 0 THEN buy_dollar_pos + 1
-                        WHEN buy_at_pos > 0 THEN buy_at_pos + 1
-                        WHEN buy_under_pos > 0 THEN buy_under_pos + 6
-                        WHEN buy_at_word_pos > 0 THEN buy_at_word_pos + 3
-                        ELSE INSTR(buy_segment, ' ') + 1
-                    END,
-                    CASE 
-                        WHEN INSTR(
-                            SUBSTR(
-                                buy_segment,
-                                CASE 
-                                    WHEN buy_dollar_pos > 0 THEN buy_dollar_pos + 1
-                                    WHEN buy_at_pos > 0 THEN buy_at_pos + 1
-                                    WHEN buy_under_pos > 0 THEN buy_under_pos + 6
-                                    WHEN buy_at_word_pos > 0 THEN buy_at_word_pos + 3
-                                    ELSE INSTR(buy_segment, ' ') + 1
-                                END
+                REPLACE(
+                    REPLACE(
+                        REPLACE(
+                            REPLACE(
+                                SUBSTR(
+                                    buy_segment,
+                                    CASE 
+                                        WHEN INSTR(buy_segment, '@') > 0 
+                                        THEN INSTR(buy_segment, '@') + 1
+                                        WHEN INSTR(buy_segment, '$') > 0 
+                                        THEN INSTR(buy_segment, '$') + 1
+                                        WHEN INSTR(buy_segment, 'UNDER') > 0 
+                                        THEN INSTR(buy_segment, 'UNDER') + 5
+                                        WHEN INSTR(buy_segment, 'UP TO') > 0 
+                                        THEN INSTR(buy_segment, 'UP TO') + 5
+                                        WHEN INSTR(buy_segment, 'AT') > 0 
+                                        THEN INSTR(buy_segment, 'AT') + 2
+                                        ELSE INSTR(buy_segment, ' ') + 1
+                                    END,
+                                    20  -- Get enough characters to capture the number
+                                ),
+                                '$', ''
                             ),
-                            ' '
-                        ) > 0
-                        THEN INSTR(
-                            SUBSTR(
-                                buy_segment,
-                                CASE 
-                                    WHEN buy_dollar_pos > 0 THEN buy_dollar_pos + 1
-                                    WHEN buy_at_pos > 0 THEN buy_at_pos + 1
-                                    WHEN buy_under_pos > 0 THEN buy_under_pos + 6
-                                    WHEN buy_at_word_pos > 0 THEN buy_at_word_pos + 3
-                                    ELSE INSTR(buy_segment, ' ') + 1
-                                END
-                            ),
-                            ' '
-                        ) - 1
-                        ELSE 10
-                    END
+                            '@', ''
+                        ),
+                        ' ', ''
+                    ),
+                    ',', ''
                 )
             ) AS DECIMAL
         ) as buy_price,
+        -- Extract first number after STOP
         CAST(
             TRIM(
-                SUBSTR(
-                    stop_segment,
-                    CASE 
-                        WHEN stop_dollar_pos > 0 THEN stop_dollar_pos + 1
-                        WHEN stop_at_pos > 0 THEN stop_at_pos + 1
-                        WHEN stop_at_word_pos > 0 THEN stop_at_word_pos + 3
-                        ELSE INSTR(stop_segment, ' ') + 1
-                    END,
-                    CASE 
-                        WHEN INSTR(
-                            SUBSTR(
-                                stop_segment,
-                                CASE 
-                                    WHEN stop_dollar_pos > 0 THEN stop_dollar_pos + 1
-                                    WHEN stop_at_pos > 0 THEN stop_at_pos + 1
-                                    WHEN stop_at_word_pos > 0 THEN stop_at_word_pos + 3
-                                    ELSE INSTR(stop_segment, ' ') + 1
-                                END
+                REPLACE(
+                    REPLACE(
+                        REPLACE(
+                            REPLACE(
+                                SUBSTR(
+                                    stop_segment,
+                                    CASE 
+                                        WHEN INSTR(stop_segment, '@') > 0 
+                                        THEN INSTR(stop_segment, '@') + 1
+                                        WHEN INSTR(stop_segment, '$') > 0 
+                                        THEN INSTR(stop_segment, '$') + 1
+                                        WHEN INSTR(stop_segment, 'AT') > 0 
+                                        THEN INSTR(stop_segment, 'AT') + 2
+                                        ELSE INSTR(stop_segment, ' ') + 1
+                                    END,
+                                    20  -- Get enough characters to capture the number
+                                ),
+                                '$', ''
                             ),
-                            ' '
-                        ) > 0
-                        THEN INSTR(
-                            SUBSTR(
-                                stop_segment,
-                                CASE 
-                                    WHEN stop_dollar_pos > 0 THEN stop_dollar_pos + 1
-                                    WHEN stop_at_pos > 0 THEN stop_at_pos + 1
-                                    WHEN stop_at_word_pos > 0 THEN stop_at_word_pos + 3
-                                    ELSE INSTR(stop_segment, ' ') + 1
-                                END
-                            ),
-                            ' '
-                        ) - 1
-                        ELSE 10
-                    END
+                            '@', ''
+                        ),
+                        ' ', ''
+                    ),
+                    ',', ''
                 )
             ) AS DECIMAL
         ) as stop_price,
+        -- Extract first number after TARGET
         CAST(
             TRIM(
-                SUBSTR(
-                    target_segment,
-                    CASE 
-                        WHEN target_dollar_pos > 0 THEN target_dollar_pos + 1
-                        WHEN target_at_pos > 0 THEN target_at_pos + 1
-                        WHEN target_at_word_pos > 0 THEN target_at_word_pos + 3
-                        ELSE INSTR(target_segment, ' ') + 1
-                    END,
-                    CASE 
-                        WHEN INSTR(
-                            SUBSTR(
-                                target_segment,
-                                CASE 
-                                    WHEN target_dollar_pos > 0 THEN target_dollar_pos + 1
-                                    WHEN target_at_pos > 0 THEN target_at_pos + 1
-                                    WHEN target_at_word_pos > 0 THEN target_at_word_pos + 3
-                                    ELSE INSTR(target_segment, ' ') + 1
-                                END
+                REPLACE(
+                    REPLACE(
+                        REPLACE(
+                            REPLACE(
+                                SUBSTR(
+                                    target_segment,
+                                    CASE 
+                                        WHEN INSTR(target_segment, '@') > 0 
+                                        THEN INSTR(target_segment, '@') + 1
+                                        WHEN INSTR(target_segment, '$') > 0 
+                                        THEN INSTR(target_segment, '$') + 1
+                                        WHEN INSTR(target_segment, 'AT') > 0 
+                                        THEN INSTR(target_segment, 'AT') + 2
+                                        ELSE INSTR(target_segment, ' ') + 1
+                                    END,
+                                    20  -- Get enough characters to capture the number
+                                ),
+                                '$', ''
                             ),
-                            ' '
-                        ) > 0
-                        THEN INSTR(
-                            SUBSTR(
-                                target_segment,
-                                CASE 
-                                    WHEN target_dollar_pos > 0 THEN target_dollar_pos + 1
-                                    WHEN target_at_pos > 0 THEN target_at_pos + 1
-                                    WHEN target_at_word_pos > 0 THEN target_at_word_pos + 3
-                                    ELSE INSTR(target_segment, ' ') + 1
-                                END
-                            ),
-                            ' '
-                        ) - 1
-                        ELSE 10
-                    END
+                            '@', ''
+                        ),
+                        ' ', ''
+                    ),
+                    ',', ''
                 )
             ) AS DECIMAL
-        ) as target_price,
-        buy_segment,
-        stop_segment,
-        target_segment
+        ) as target_price
     FROM number_positions
-    WHERE 
-        -- Basic validation on extracted text
-        LENGTH(TRIM(buy_segment)) > 0
-        AND LENGTH(TRIM(stop_segment)) > 0
-        AND LENGTH(TRIM(target_segment)) > 0
 ),
 validated_prices AS (
     -- Apply validation rules to extracted prices
@@ -219,21 +176,25 @@ SET
         SELECT buy_price 
         FROM temp_prices 
         WHERE temp_prices.email_id = trade_signals.email_id
+        AND temp_prices.ticker = trade_signals.ticker
     ),
     stop_price = (
         SELECT stop_price
         FROM temp_prices 
         WHERE temp_prices.email_id = trade_signals.email_id
+        AND temp_prices.ticker = trade_signals.ticker
     ),
     target_price = (
         SELECT target_price
         FROM temp_prices 
         WHERE temp_prices.email_id = trade_signals.email_id
+        AND temp_prices.ticker = trade_signals.ticker
     )
 WHERE EXISTS (
     SELECT 1 
     FROM temp_prices 
     WHERE temp_prices.email_id = trade_signals.email_id
+    AND temp_prices.ticker = trade_signals.ticker
 );
 
 -- Show statistics about price extraction
@@ -281,4 +242,7 @@ WHERE ts.ticker IS NOT NULL
 ORDER BY ts.signal_date DESC
 LIMIT 5;
 
-COMMIT; 
+COMMIT;
+
+-- Vacuum to clean up
+VACUUM; 
