@@ -1519,7 +1519,7 @@ func parseAndSaveSignal(email EmailSignal, db *DB, workerID int) error {
 			workerID, email.ID, signal.Ticker, signal.BuyPrice, signal.StopPrice, signal.TargetPrice)
 	}
 
-	// Save to parse_buy_stop_target staging table
+	// Save to parse_buy_stop_target staging table with cleaned text
 	if err := saveToParseBuyStopTarget(email, signal, htmlStripped, db); err != nil {
 		return fmt.Errorf("failed to save parsed signal: %v", err)
 	}
@@ -1544,24 +1544,60 @@ func extractTradingSignalWithText(email EmailSignal) (*TradingSignal, string, er
 		EntryDate:  email.Date.Add(24 * time.Hour).Unix() * 1000, // Next day in milliseconds
 	}
 
-	// Extract ticker symbol (common patterns) - use original case for ticker extraction
-	tickerPatterns := []string{
-		`\b([A-Z]{1,5})\s*(?:buy|BUY)`,
-		`(?:buy|BUY)\s*([A-Z]{1,5})\b`,
-		`(?:symbol|ticker|stock)[:=]?\s*([A-Z]{1,5})\b`,
+	// Extract ticker symbol using proven patterns from existing codebase
+	// Common exclusion words that are not tickers
+	exclusionWords := map[string]bool{
+		"BUY": true, "SELL": true, "STOP": true, "TARGET": true, "PRICE": true,
+		"ENTRY": true, "EXIT": true, "LOSS": true, "PROFIT": true, "TAKE": true,
+		"AT": true, "TO": true, "FROM": true, "AND": true, "OR": true, "THE": true,
 	}
 	
-	for _, pattern := range tickerPatterns {
+	// Primary: Exchange format patterns (most reliable from SQL implementation)
+	exchangePatterns := []string{
+		`\(\s*NASDAQ:\s*([A-Z]{2,5})\s*\)`, // (NASDAQ: TICKER)
+		`\(\s*NYSE:\s*([A-Z]{2,5})\s*\)`,   // (NYSE: TICKER)
+		`NASDAQ:\s*([A-Z]{2,5})\b`,         // NASDAQ: TICKER
+		`NYSE:\s*([A-Z]{2,5})\b`,           // NYSE: TICKER
+	}
+	
+	for _, pattern := range exchangePatterns {
 		re := regexp.MustCompile(pattern)
-		// Use original stripped text to preserve ticker case
 		if matches := re.FindStringSubmatch(htmlStripped); len(matches) > 1 {
-			signal.Ticker = strings.ToUpper(matches[1]) // Ensure uppercase ticker
-			break
+			ticker := strings.ToUpper(matches[1])
+			if !exclusionWords[ticker] && len(ticker) >= 2 && len(ticker) <= 5 {
+				signal.Ticker = ticker
+				break
+			}
 		}
-		// Also try lowercase version
-		if matches := re.FindStringSubmatch(htmlLower); len(matches) > 1 {
-			signal.Ticker = strings.ToUpper(matches[1]) // Ensure uppercase ticker
-			break
+	}
+	
+	// Secondary: Proximity patterns (from main.go implementation)
+	if signal.Ticker == "" {
+		proximityPatterns := []string{
+			`\b([A-Z]{2,5})\s*(?:buy|BUY)`,     // Ticker followed by buy
+			`(?:buy|BUY)\s*([A-Z]{2,5})\b`,     // Buy followed by ticker
+			`(?:symbol|ticker|stock)[:=]?\s*([A-Z]{2,5})\b`, // Explicit ticker mention
+			`\b([A-Z]{2,5})\s+at\s+\$?\d+`,    // Ticker at price
+			`\b([A-Z]{2,5})\s*[-:]\s*\$?\d+`,  // Ticker: price or Ticker - price
+		}
+		
+		for _, pattern := range proximityPatterns {
+			re := regexp.MustCompile(pattern)
+			if matches := re.FindStringSubmatch(htmlStripped); len(matches) > 1 {
+				ticker := strings.ToUpper(matches[1])
+				if !exclusionWords[ticker] && len(ticker) >= 2 && len(ticker) <= 5 {
+					signal.Ticker = ticker
+					break
+				}
+			}
+			// Also try with lowercase version for case variations
+			if matches := re.FindStringSubmatch(htmlLower); len(matches) > 1 {
+				ticker := strings.ToUpper(matches[1])
+				if !exclusionWords[ticker] && len(ticker) >= 2 && len(ticker) <= 5 {
+					signal.Ticker = ticker
+					break
+				}
+			}
 		}
 	}
 
