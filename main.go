@@ -17,7 +17,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/jaytaylor/html2text"
+	"github.com/microcosm-cc/bluemonday"
 	"golang.org/x/net/html"
 	"golang.org/x/oauth2"
 	"google.golang.org/api/gmail/v1"
@@ -83,6 +83,14 @@ type DB struct {
 
 func NewDB(db *sql.DB) *DB {
 	return &DB{DB: db}
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // printCredentialInfo reads and prints all available information from the credentials file
@@ -403,13 +411,13 @@ func getGmailClient(ctx context.Context) (*http.Client, error) {
 
 	// Create a token source that will automatically refresh the token
 	tokenSource := config.TokenSource(ctx, token)
-	
+
 	// Get a fresh token (this will refresh if needed)
 	freshToken, err := tokenSource.Token()
 	if err != nil {
 		return nil, fmt.Errorf("failed to refresh token: %v", err)
 	}
-	
+
 	// Save the refreshed token if it was updated
 	if freshToken.AccessToken != token.AccessToken {
 		log.Printf("Token was refreshed, saving new token")
@@ -1063,7 +1071,7 @@ func handleOAuthInfo(w http.ResponseWriter, r *http.Request) {
 		</body>
 	</html>
 	`, redirectURI, credentialsFile, redirectURI)
-	
+
 	fmt.Fprint(w, html)
 }
 
@@ -1304,7 +1312,7 @@ func enrichThreadsWithEmails(srv *gmail.Service, threadIDs []string, db *DB) err
 		} else {
 			processedCount++
 		}
-		
+
 		// Log progress every 10 threads
 		if (processedCount+len(errors))%10 == 0 {
 			log.Printf("Progress: %d/%d threads processed", processedCount+len(errors), len(threadIDs))
@@ -1414,7 +1422,7 @@ func getBuySignalEmails(db *DB) ([]EmailSignal, error) {
 		AND LOWER(html) LIKE '%target%'
 		ORDER BY date DESC
 	`
-	
+
 	rows, err := db.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query signal emails: %v", err)
@@ -1477,7 +1485,7 @@ func parseSignalsConcurrently(emails []EmailSignal, db *DB) (int, int, error) {
 		} else {
 			processedCount++
 		}
-		
+
 		// Log progress every 25 emails
 		if (processedCount+len(errors))%25 == 0 {
 			log.Printf("Parsing progress: %d/%d emails processed", processedCount+len(errors), len(emails))
@@ -1501,7 +1509,7 @@ func parseSignalsConcurrently(emails []EmailSignal, db *DB) (int, int, error) {
 // parseAndSaveSignal extracts trading signal from email HTML and saves to parse_buy_stop_target
 func parseAndSaveSignal(email EmailSignal, db *DB, workerID int) error {
 	// Parse trading signal from HTML
-	signal, htmlStripped, err := extractTradingSignalWithText(email)
+	signal, cleanedText, err := extractTradingSignalWithText(email)
 	if err != nil {
 		return fmt.Errorf("failed to extract signal: %v", err)
 	}
@@ -1512,58 +1520,59 @@ func parseAndSaveSignal(email EmailSignal, db *DB, workerID int) error {
 		signal = &TradingSignal{
 			EmailID:    email.ID,
 			SignalDate: email.Date.Unix() * 1000,
-			EntryDate:  email.Date.Add(24 * time.Hour).Unix() * 1000,
+			EntryDate:  email.Date.Add(24*time.Hour).Unix() * 1000,
 		}
 		log.Printf("Worker %d: No valid signal found in email %s, saving empty record", workerID, email.ID)
 	} else {
-		log.Printf("Worker %d: Parsed signal for %s - Ticker: %s, Buy: %.2f, Stop: %.2f, Target: %.2f", 
+		log.Printf("Worker %d: Parsed signal for %s - Ticker: %s, Buy: %.2f, Stop: %.2f, Target: %.2f",
 			workerID, email.ID, signal.Ticker, signal.BuyPrice, signal.StopPrice, signal.TargetPrice)
 	}
 
 	// Save to parse_buy_stop_target staging table with cleaned text
-	if err := saveToParseBuyStopTarget(email, signal, htmlStripped, db); err != nil {
+	if err := saveToParseBuyStopTarget(email, signal, cleanedText, db); err != nil {
 		return fmt.Errorf("failed to save parsed signal: %v", err)
 	}
-	
+
 	return nil
 }
 
 // extractTradingSignalWithText parses HTML content and returns both signal and cleaned text
 func extractTradingSignalWithText(email EmailSignal) (*TradingSignal, string, error) {
 	htmlContent := email.HTML
-	
-	// Limit to first 500 characters of HTML
-	if len(htmlContent) > 500 {
-		htmlContent = htmlContent[:500]
+	log.Printf("PARSING: Email ID %s, original HTML length: %d", email.ID, len(htmlContent))
+	log.Printf("PARSING: Original HTML first 200 chars: %s", strings.ReplaceAll(htmlContent[:min(200, len(htmlContent))], "\n", " "))
+
+	// Limit to first 1000 characters of HTML
+	if len(htmlContent) > 1000 {
+		htmlContent = htmlContent[:1000]
+		log.Printf("PARSING: Truncated HTML to 500 chars")
 	}
-	
-	// Use proper HTML-to-text library to strip all HTML/XML tags and entities
-	plainText, err := html2text.FromString(htmlContent, html2text.Options{
-		PrettyTables: false,
-		TabStops:     0,
-		OmitLinks:    true,
-	})
-	if err != nil {
-		// Fallback to regex if html2text fails
-		plainText = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(htmlContent, " ")
-	}
-	
+
+	// Use bluemonday to properly strip all HTML/XML tags and entities
+	p := bluemonday.StripTagsPolicy()
+	plainText := p.Sanitize(htmlContent)
+	log.Printf("PARSING: After bluemonday stripping, length: %d", len(plainText))
+	log.Printf("PARSING: Stripped text first 200 chars: %s", strings.ReplaceAll(plainText[:min(200, len(plainText))], "\n", " "))
+
 	// Clean up whitespace and normalize
 	plainText = regexp.MustCompile(`[\r\n\t]+`).ReplaceAllString(plainText, " ")
 	plainText = regexp.MustCompile(`\s+`).ReplaceAllString(plainText, " ")
 	plainText = strings.TrimSpace(plainText)
-	
+	log.Printf("PARSING: After whitespace cleanup, length: %d", len(plainText))
+	log.Printf("PARSING: Final cleaned text: %s", plainText[:min(200, len(plainText))])
+
 	// Create cleaned lowercase version for raw_html field storage
 	cleanedText := strings.ToLower(plainText)
-	
+	log.Printf("PARSING: Lowercase version for storage: %s", cleanedText[:min(100, len(cleanedText))])
+
 	// Keep original case for ticker extraction, lowercase for price patterns
 	htmlLower := strings.ToLower(plainText)
-	
+
 	// Initialize signal
 	signal := &TradingSignal{
 		EmailID:    email.ID,
-		SignalDate: email.Date.Unix() * 1000, // Convert to milliseconds
-		EntryDate:  email.Date.Add(24 * time.Hour).Unix() * 1000, // Next day in milliseconds
+		SignalDate: email.Date.Unix() * 1000,                   // Convert to milliseconds
+		EntryDate:  email.Date.Add(24*time.Hour).Unix() * 1000, // Next day in milliseconds
 	}
 
 	// Extract ticker symbol using proven patterns from existing codebase
@@ -1573,7 +1582,8 @@ func extractTradingSignalWithText(email EmailSignal) (*TradingSignal, string, er
 		"ENTRY": true, "EXIT": true, "LOSS": true, "PROFIT": true, "TAKE": true,
 		"AT": true, "TO": true, "FROM": true, "AND": true, "OR": true, "THE": true,
 	}
-	
+	log.Printf("PARSING: Starting ticker extraction from text: %s", plainText[:min(100, len(plainText))])
+
 	// Primary: Exchange format patterns (most reliable from SQL implementation)
 	exchangePatterns := []string{
 		`\(\s*NASDAQ:\s*([A-Z]{2,5})\s*\)`, // (NASDAQ: TICKER)
@@ -1581,109 +1591,144 @@ func extractTradingSignalWithText(email EmailSignal) (*TradingSignal, string, er
 		`NASDAQ:\s*([A-Z]{2,5})\b`,         // NASDAQ: TICKER
 		`NYSE:\s*([A-Z]{2,5})\b`,           // NYSE: TICKER
 	}
-	
+
 	for _, pattern := range exchangePatterns {
 		re := regexp.MustCompile(pattern)
-		if matches := re.FindStringSubmatch(htmlStripped); len(matches) > 1 {
+		if matches := re.FindStringSubmatch(plainText); len(matches) > 1 {
 			ticker := strings.ToUpper(matches[1])
+			log.Printf("PARSING: Found exchange pattern match: %s -> %s", pattern, ticker)
 			if !exclusionWords[ticker] && len(ticker) >= 2 && len(ticker) <= 5 {
 				signal.Ticker = ticker
+				log.Printf("PARSING: Set ticker from exchange pattern: %s", ticker)
 				break
+			} else {
+				log.Printf("PARSING: Rejected ticker %s (excluded or invalid length)", ticker)
 			}
 		}
 	}
-	
+
 	// Secondary: Proximity patterns (from main.go implementation)
 	if signal.Ticker == "" {
+		log.Printf("PARSING: No ticker found in exchange patterns, trying proximity patterns")
 		proximityPatterns := []string{
-			`\b([A-Z]{2,5})\s*(?:buy|BUY)`,     // Ticker followed by buy
-			`(?:buy|BUY)\s*([A-Z]{2,5})\b`,     // Buy followed by ticker
+			`\b([A-Z]{2,5})\s*(?:buy|BUY)`,                  // Ticker followed by buy
+			`(?:buy|BUY)\s*([A-Z]{2,5})\b`,                  // Buy followed by ticker
 			`(?:symbol|ticker|stock)[:=]?\s*([A-Z]{2,5})\b`, // Explicit ticker mention
-			`\b([A-Z]{2,5})\s+at\s+\$?\d+`,    // Ticker at price
-			`\b([A-Z]{2,5})\s*[-:]\s*\$?\d+`,  // Ticker: price or Ticker - price
+			`\b([A-Z]{2,5})\s+at\s+\$?\d+`,                  // Ticker at price
+			`\b([A-Z]{2,5})\s*[-:]\s*\$?\d+`,                // Ticker: price or Ticker - price
 		}
-		
+
 		for _, pattern := range proximityPatterns {
 			re := regexp.MustCompile(pattern)
-			if matches := re.FindStringSubmatch(htmlStripped); len(matches) > 1 {
+			if matches := re.FindStringSubmatch(plainText); len(matches) > 1 {
 				ticker := strings.ToUpper(matches[1])
+				log.Printf("PARSING: Found proximity pattern match: %s -> %s", pattern, ticker)
 				if !exclusionWords[ticker] && len(ticker) >= 2 && len(ticker) <= 5 {
 					signal.Ticker = ticker
+					log.Printf("PARSING: Set ticker from proximity pattern: %s", ticker)
 					break
+				} else {
+					log.Printf("PARSING: Rejected proximity ticker %s (excluded or invalid length)", ticker)
 				}
 			}
 			// Also try with lowercase version for case variations
 			if matches := re.FindStringSubmatch(htmlLower); len(matches) > 1 {
 				ticker := strings.ToUpper(matches[1])
+				log.Printf("PARSING: Found lowercase proximity pattern match: %s -> %s", pattern, ticker)
 				if !exclusionWords[ticker] && len(ticker) >= 2 && len(ticker) <= 5 {
 					signal.Ticker = ticker
+					log.Printf("PARSING: Set ticker from lowercase proximity pattern: %s", ticker)
 					break
+				} else {
+					log.Printf("PARSING: Rejected lowercase proximity ticker %s (excluded or invalid length)", ticker)
 				}
 			}
 		}
 	}
 
 	// Extract BUY price - use lowercase for pattern matching
+	log.Printf("PARSING: Starting BUY price extraction from: %s", htmlLower[:min(100, len(htmlLower))])
 	buyPatterns := []string{
 		`buy.*?(?:at|@|price|:)?\s*\$?(\d+\.?\d*)`,
 		`entry.*?(?:at|@|price|:)?\s*\$?(\d+\.?\d*)`,
 		`buy\s+(?:at\s+)?\$?(\d+\.?\d*)`,
 	}
-	
+
 	for _, pattern := range buyPatterns {
 		re := regexp.MustCompile(pattern)
 		if matches := re.FindStringSubmatch(htmlLower); len(matches) > 1 {
+			log.Printf("PARSING: Found BUY price pattern match: %s -> %s", pattern, matches[1])
 			if price, err := strconv.ParseFloat(matches[1], 64); err == nil {
 				signal.BuyPrice = price
+				log.Printf("PARSING: Set BUY price: %.2f", price)
 				break
+			} else {
+				log.Printf("PARSING: Failed to parse BUY price %s: %v", matches[1], err)
 			}
 		}
 	}
 
 	// Extract STOP LOSS price - use lowercase for pattern matching
+	log.Printf("PARSING: Starting STOP price extraction")
 	stopPatterns := []string{
 		`(?:stop|stop[-\s]?loss).*?(?:at|@|price|:)?\s*\$?(\d+\.?\d*)`,
 		`(?:sl|s\.l\.).*?(?:at|@|price|:)?\s*\$?(\d+\.?\d*)`,
 		`stop\s+(?:at\s+)?\$?(\d+\.?\d*)`,
 	}
-	
+
 	for _, pattern := range stopPatterns {
 		re := regexp.MustCompile(pattern)
 		if matches := re.FindStringSubmatch(htmlLower); len(matches) > 1 {
+			log.Printf("PARSING: Found STOP price pattern match: %s -> %s", pattern, matches[1])
 			if price, err := strconv.ParseFloat(matches[1], 64); err == nil {
 				signal.StopPrice = price
+				log.Printf("PARSING: Set STOP price: %.2f", price)
 				break
+			} else {
+				log.Printf("PARSING: Failed to parse STOP price %s: %v", matches[1], err)
 			}
 		}
 	}
 
 	// Extract TARGET price - use lowercase for pattern matching
+	log.Printf("PARSING: Starting TARGET price extraction")
 	targetPatterns := []string{
 		`(?:target|take[-\s]?profit).*?(?:at|@|price|:)?\s*\$?(\d+\.?\d*)`,
 		`(?:tp|t\.p\.).*?(?:at|@|price|:)?\s*\$?(\d+\.?\d*)`,
 		`target\s+(?:at\s+)?\$?(\d+\.?\d*)`,
 	}
-	
+
 	for _, pattern := range targetPatterns {
 		re := regexp.MustCompile(pattern)
 		if matches := re.FindStringSubmatch(htmlLower); len(matches) > 1 {
+			log.Printf("PARSING: Found TARGET price pattern match: %s -> %s", pattern, matches[1])
 			if price, err := strconv.ParseFloat(matches[1], 64); err == nil {
 				signal.TargetPrice = price
+				log.Printf("PARSING: Set TARGET price: %.2f", price)
 				break
+			} else {
+				log.Printf("PARSING: Failed to parse TARGET price %s: %v", matches[1], err)
 			}
 		}
 	}
 
 	// Validate signal - must have ticker and at least buy price
+	log.Printf("PARSING: Final signal validation - Ticker: '%s', BuyPrice: %.2f, StopPrice: %.2f, TargetPrice: %.2f",
+		signal.Ticker, signal.BuyPrice, signal.StopPrice, signal.TargetPrice)
+
 	if signal.Ticker == "" || signal.BuyPrice == 0 {
-		return nil, htmlStripped, nil // No valid signal found
+		log.Printf("PARSING: Signal validation FAILED - missing ticker or buy price")
+		return nil, cleanedText, nil // No valid signal found
 	}
 
-	return signal, htmlStripped, nil
+	log.Printf("PARSING: Signal validation PASSED - returning valid signal")
+	return signal, cleanedText, nil
 }
 
 // saveToParseBuyStopTarget saves parsed data to the staging table
 func saveToParseBuyStopTarget(email EmailSignal, signal *TradingSignal, htmlStripped string, db *DB) error {
+	log.Printf("SAVING: Email ID %s, cleaned text length: %d", email.ID, len(htmlStripped))
+	log.Printf("SAVING: Cleaned text preview: %s", htmlStripped[:min(100, len(htmlStripped))])
 	stmt, err := db.Prepare(`
 		INSERT INTO parse_buy_stop_target (email_id, ticker, signal_date, entry_date, buy_price, stop_price, target_price, raw_html, parsed_text)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1784,7 +1829,7 @@ func getCleanSignalsFromParsing(db *DB) ([]CleanSignal, error) {
 		AND target_price > 0
 		ORDER BY signal_date DESC
 	`
-	
+
 	rows, err := db.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query clean signals: %v", err)
@@ -1847,7 +1892,7 @@ func processCleanSignalsConcurrently(signals []CleanSignal, db *DB) (int, int, e
 		} else {
 			processedCount++
 		}
-		
+
 		// Log progress every 20 signals
 		if (processedCount+len(errors))%20 == 0 {
 			log.Printf("Processing progress: %d/%d signals processed", processedCount+len(errors), len(signals))
@@ -1874,10 +1919,10 @@ func upsertToTradeSignals(signal CleanSignal, db *DB, workerID int) error {
 	var existingID string
 	checkQuery := `SELECT email_id FROM trade_signals WHERE signal_date = ? LIMIT 1`
 	err := db.QueryRow(checkQuery, signal.SignalDate).Scan(&existingID)
-	
+
 	if err == nil {
 		// Signal with same date exists, skip
-		log.Printf("Worker %d: Skipping signal %s - date %d already exists (email_id: %s)", 
+		log.Printf("Worker %d: Skipping signal %s - date %d already exists (email_id: %s)",
 			workerID, signal.EmailID, signal.SignalDate, existingID)
 		return nil
 	} else if err != sql.ErrNoRows {
@@ -1914,7 +1959,7 @@ func upsertToTradeSignals(signal CleanSignal, db *DB, workerID int) error {
 		return fmt.Errorf("failed to upsert clean signal: %v", err)
 	}
 
-	log.Printf("Worker %d: Processed clean signal %s - Ticker: %s, Buy: %.2f, Stop: %.2f, Target: %.2f", 
+	log.Printf("Worker %d: Processed clean signal %s - Ticker: %s, Buy: %.2f, Stop: %.2f, Target: %.2f",
 		workerID, signal.EmailID, signal.Ticker, signal.BuyPrice, signal.StopPrice, signal.TargetPrice)
 
 	return nil
