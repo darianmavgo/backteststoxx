@@ -17,6 +17,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/jaytaylor/html2text"
 	"golang.org/x/net/html"
 	"golang.org/x/oauth2"
 	"google.golang.org/api/gmail/v1"
@@ -1527,15 +1528,36 @@ func parseAndSaveSignal(email EmailSignal, db *DB, workerID int) error {
 	return nil
 }
 
-// extractTradingSignalWithText parses HTML content and returns both signal and stripped text
+// extractTradingSignalWithText parses HTML content and returns both signal and cleaned text
 func extractTradingSignalWithText(email EmailSignal) (*TradingSignal, string, error) {
-	html := email.HTML
+	htmlContent := email.HTML
 	
-	// Remove HTML tags and convert to lowercase for easier parsing
-	htmlStripped := regexp.MustCompile(`<[^>]*>`).ReplaceAllString(html, " ")
-	htmlStripped = regexp.MustCompile(`\s+`).ReplaceAllString(htmlStripped, " ")
-	htmlStripped = strings.TrimSpace(htmlStripped)
-	htmlLower := strings.ToLower(htmlStripped)
+	// Limit to first 500 characters of HTML
+	if len(htmlContent) > 500 {
+		htmlContent = htmlContent[:500]
+	}
+	
+	// Use proper HTML-to-text library to strip all HTML/XML tags and entities
+	plainText, err := html2text.FromString(htmlContent, html2text.Options{
+		PrettyTables: false,
+		TabStops:     0,
+		OmitLinks:    true,
+	})
+	if err != nil {
+		// Fallback to regex if html2text fails
+		plainText = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(htmlContent, " ")
+	}
+	
+	// Clean up whitespace and normalize
+	plainText = regexp.MustCompile(`[\r\n\t]+`).ReplaceAllString(plainText, " ")
+	plainText = regexp.MustCompile(`\s+`).ReplaceAllString(plainText, " ")
+	plainText = strings.TrimSpace(plainText)
+	
+	// Create cleaned lowercase version for raw_html field storage
+	cleanedText := strings.ToLower(plainText)
+	
+	// Keep original case for ticker extraction, lowercase for price patterns
+	htmlLower := strings.ToLower(plainText)
 	
 	// Initialize signal
 	signal := &TradingSignal{
