@@ -301,3 +301,115 @@ func enrichSingleThread(workerID int, service *gmail.Service, threadID string, d
 
 	return nil
 }
+
+// enrichEmailsV1_2Concurrently re-downloads emails for all thread_ids from emails_v1_1 into emails_v1_2
+func enrichEmailsV1_2Concurrently(db *DB) error {
+	log.Printf("Starting concurrent email re-download for emails_v1_2 with InternalDate")
+	
+	// Get thread IDs from emails_v1_1
+	threadIDs, err := db.getThreadIDsFromV1_1()
+	if err != nil {
+		return fmt.Errorf("failed to get thread IDs from emails_v1_1: %v", err)
+	}
+
+	log.Printf("Found %d thread IDs from emails_v1_1 to re-download", len(threadIDs))
+
+	if len(threadIDs) == 0 {
+		log.Printf("No thread IDs found in emails_v1_1 for re-download")
+		return nil
+	}
+
+	ctx := context.Background()
+	service, err := getGmailService(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get Gmail service: %v", err)
+	}
+
+	// Process thread IDs concurrently
+	numWorkers := 25 // Moderate concurrency for full email fetching
+	jobs := make(chan string, len(threadIDs))
+	results := make(chan error, len(threadIDs))
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			enrichEmailV1_2Worker(workerID, service, jobs, results, db)
+		}(i)
+	}
+
+	// Send jobs
+	go func() {
+		for _, threadID := range threadIDs {
+			jobs <- threadID
+		}
+		close(jobs)
+	}()
+
+	// Wait for all workers to complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results
+	var errors []error
+	var processedCount int
+	for err := range results {
+		if err != nil {
+			errors = append(errors, err)
+		} else {
+			processedCount++
+		}
+
+		// Log progress every 10 threads
+		if (processedCount+len(errors))%10 == 0 {
+			log.Printf("Progress: %d/%d threads processed", processedCount+len(errors), len(threadIDs))
+		}
+	}
+
+	log.Printf("emails_v1_2 enrichment complete: %d threads processed successfully, %d errors", processedCount, len(errors))
+
+	if len(errors) > 0 {
+		log.Printf("First few errors: %v", errors[:min(5, len(errors))])
+	}
+
+	return nil
+}
+
+// enrichEmailV1_2Worker processes individual thread IDs for emails_v1_2 enrichment
+func enrichEmailV1_2Worker(workerID int, service *gmail.Service, jobs <-chan string, results chan<- error, db *DB) {
+	for threadID := range jobs {
+		err := enrichSingleThreadV1_2(workerID, service, threadID, db)
+		results <- err
+	}
+}
+
+// enrichSingleThreadV1_2 fetches full email data for a thread and saves to emails_v1_2 table
+func enrichSingleThreadV1_2(workerID int, service *gmail.Service, threadID string, db *DB) error {
+	// Get messages in the thread
+	thread, err := service.Users.Threads.Get("me", threadID).Do()
+	if err != nil {
+		return fmt.Errorf("worker %d: failed to get thread %s: %v", workerID, threadID, err)
+	}
+
+	// Process each message in the thread
+	for _, message := range thread.Messages {
+		// Get full message content
+		fullMessage, err := service.Users.Messages.Get("me", message.Id).Format("full").Do()
+		if err != nil {
+			log.Printf("Worker %d: failed to get full message %s: %v", workerID, message.Id, err)
+			continue
+		}
+
+		// Save to emails_v1_2 table with InternalDate
+		if err := db.upsertFullEmailToV1_2(fullMessage); err != nil {
+			log.Printf("Worker %d: failed to save full email to v1_2 %s: %v", workerID, message.Id, err)
+			continue
+		}
+	}
+
+	return nil
+}

@@ -142,6 +142,11 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
             </div>
             
             <div class="endpoint">
+                <strong>2b. Enrich Emails v1.2:</strong> POST /enrich-emails-v1-2<br>
+                <small>⭐ Re-downloads emails from emails_v1_1 thread_ids with InternalDate field</small>
+            </div>
+            
+            <div class="endpoint">
                 <strong>3. Parse Signals (Go):</strong> POST /parse-signals<br>
                 <small>Extracts trading signals from email HTML using Go parsing logic</small>
             </div>
@@ -161,6 +166,7 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
             <h3>🚀 Quick Actions</h3>
             <button onclick="downloadEmails()" class="button">📥 Download Emails</button>
             <button onclick="enrichEmails()" class="button secondary">📧 Enrich Emails</button>
+            <button onclick="enrichEmailsV1_2()" class="button secondary">⭐ Enrich Emails v1.2</button>
             <button onclick="parseSignals()" class="button warning">🔍 Parse Signals (Go)</button>
             <button onclick="sqlParseSignals()" class="button warning">⭐ Parse Signals (SQL)</button>
             <button onclick="processSignals()" class="button secondary">⚡ Process Signals</button>
@@ -188,6 +194,14 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
         function enrichEmails() {
             updateStatus('📧 Enriching emails...');
             fetch('/enrich-emails', { method: 'POST' })
+                .then(response => response.text())
+                .then(data => updateStatus('✅ ' + data))
+                .catch(error => updateStatus('❌ Error: ' + error));
+        }
+
+        function enrichEmailsV1_2() {
+            updateStatus('⭐ Enriching emails v1.2 with InternalDate...');
+            fetch('/enrich-emails-v1-2', { method: 'POST' })
                 .then(response => response.text())
                 .then(data => updateStatus('✅ ' + data))
                 .catch(error => updateStatus('❌ Error: ' + error));
@@ -306,6 +320,27 @@ func processSignalsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "Signal processing completed successfully")
 }
 
+func enrichEmailsV1_2Handler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	db, err := setupDatabase()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Database setup failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	if err := enrichEmailsV1_2Concurrently(db); err != nil {
+		http.Error(w, fmt.Sprintf("emails_v1_2 enrichment failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprint(w, "emails_v1_2 enrichment completed successfully")
+}
+
 func main() {
 	// Create credentials directory if it doesn't exist
 	if err := os.MkdirAll(tokenDir, 0700); err != nil {
@@ -337,6 +372,7 @@ func main() {
 	http.HandleFunc("/oauth/callback", handleOAuthCallback)
 	http.HandleFunc("/download-emails", downloadEmailsHandler)
 	http.HandleFunc("/enrich-emails", enrichEmailsHandler)
+	http.HandleFunc("/enrich-emails-v1-2", enrichEmailsV1_2Handler)
 	http.HandleFunc("/parse-signals", parseSignalsHandler)
 	http.HandleFunc("/sql-parse-signals", sqlParseSignalsHandler)
 	http.HandleFunc("/process-signals", processSignalsHandler)

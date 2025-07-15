@@ -62,6 +62,21 @@ func createTables(db *sql.DB) error {
 			from_address TEXT,
 			to_address TEXT
 		)`,
+		`CREATE TABLE IF NOT EXISTS emails_v1_2 (
+			id TEXT PRIMARY KEY,
+			thread_id TEXT NOT NULL,
+			subject TEXT,
+			from_addr TEXT,
+			to_addr TEXT,
+			date DATETIME NOT NULL,
+			internal_date INTEGER,
+			internal_date_string TEXT,
+			snippet TEXT,
+			labels TEXT,
+			plain_text TEXT,
+			html TEXT,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
 		`CREATE TABLE IF NOT EXISTS parse_buy_stop_target (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			email_id TEXT UNIQUE,
@@ -128,6 +143,29 @@ func (db *DB) getThreadIDsFromLanding() ([]string, error) {
 	rows, err := db.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query thread IDs: %v", err)
+	}
+	defer rows.Close()
+
+	var threadIDs []string
+	for rows.Next() {
+		var threadID string
+		if err := rows.Scan(&threadID); err != nil {
+			log.Printf("Failed to scan thread ID: %v", err)
+			continue
+		}
+		threadIDs = append(threadIDs, threadID)
+	}
+
+	return threadIDs, nil
+}
+
+// getThreadIDsFromV1_1 retrieves all unique thread IDs from emails_v1_1
+func (db *DB) getThreadIDsFromV1_1() ([]string, error) {
+	query := `SELECT DISTINCT thread_id FROM emails_v1_1 WHERE thread_id IS NOT NULL ORDER BY thread_id`
+	
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query thread IDs from emails_v1_1: %v", err)
 	}
 	defer rows.Close()
 
@@ -402,6 +440,120 @@ func upsertToTradeSignals(signal CleanSignal, db *DB, workerID int) error {
 
 	log.Printf("Worker %d: Processed clean signal %s - Ticker: %s, Buy: %.2f, Stop: %.2f, Target: %.2f",
 		workerID, signal.EmailID, signal.Ticker, signal.BuyPrice, signal.StopPrice, signal.TargetPrice)
+
+	return nil
+}
+
+// convertInternalDateToString converts Gmail internal date (milliseconds) to YYYY-MM-DD format
+func convertInternalDateToString(internalDate int64) string {
+	if internalDate == 0 {
+		return ""
+	}
+	
+	// Convert milliseconds to seconds and create time
+	timestamp := internalDate / 1000
+	t := time.Unix(timestamp, 0)
+	return t.Format("2006-01-02")
+}
+
+// extractPlainTextFromMessage extracts plain text content from Gmail message
+func extractPlainTextFromMessage(msg *gmail.Message) string {
+	if msg.Payload == nil {
+		return ""
+	}
+	
+	return extractPlainTextFromPart(msg.Payload)
+}
+
+// extractPlainTextFromPart recursively extracts plain text from message parts
+func extractPlainTextFromPart(part *gmail.MessagePart) string {
+	// Check if this part is plain text
+	if part.MimeType == "text/plain" && part.Body != nil && part.Body.Data != "" {
+		decoded, err := decodeBase64URL(part.Body.Data)
+		if err == nil {
+			return string(decoded)
+		}
+	}
+	
+	// Check parts recursively
+	for _, subPart := range part.Parts {
+		plainContent := extractPlainTextFromPart(subPart)
+		if plainContent != "" {
+			return plainContent
+		}
+	}
+	
+	return ""
+}
+
+// upsertFullEmailToV1_2 saves complete email data to the emails_v1_2 table with InternalDate
+func (db *DB) upsertFullEmailToV1_2(msg *gmail.Message) error {
+	// Extract headers
+	var subject, from, to, date string
+	for _, header := range msg.Payload.Headers {
+		switch strings.ToLower(header.Name) {
+		case "subject":
+			subject = header.Value
+		case "from":
+			from = header.Value
+		case "to":
+			to = header.Value
+		case "date":
+			date = header.Value
+		}
+	}
+
+	// Get internal date and convert to string
+	internalDate := msg.InternalDate
+	internalDateString := convertInternalDateToString(internalDate)
+
+	// Extract content
+	plainText := extractPlainTextFromMessage(msg)
+	htmlContent := extractHTMLFromMessage(msg)
+	
+	// Format labels
+	labels := strings.Join(msg.LabelIds, ",")
+
+	stmt, err := db.Prepare(`
+		INSERT INTO emails_v1_2 (id, thread_id, subject, from_addr, to_addr, date, 
+		                        internal_date, internal_date_string, snippet, labels, 
+		                        plain_text, html)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			thread_id = excluded.thread_id,
+			subject = excluded.subject,
+			from_addr = excluded.from_addr,
+			to_addr = excluded.to_addr,
+			date = excluded.date,
+			internal_date = excluded.internal_date,
+			internal_date_string = excluded.internal_date_string,
+			snippet = excluded.snippet,
+			labels = excluded.labels,
+			plain_text = excluded.plain_text,
+			html = excluded.html
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare emails_v1_2 statement: %v", err)
+	}
+	defer stmt.Close()
+
+	_, err = stmt.Exec(
+		msg.Id,
+		msg.ThreadId,
+		subject,
+		from,
+		to,
+		date,
+		internalDate,
+		internalDateString,
+		msg.Snippet,
+		labels,
+		plainText,
+		htmlContent,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to upsert email to v1_2: %v", err)
+	}
 
 	return nil
 }
